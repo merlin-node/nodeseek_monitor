@@ -1,6 +1,7 @@
 Services:
   nodeseek-monitor:
-    build: .
+    image: ghcr.io/merlin-node/ns_monitor:latest
+
     # 或者构建后推镜像, 用 image: your/nodeseek-monitor:latest
     container_name: nodeseek-monitor
     restart: unless-stopped
