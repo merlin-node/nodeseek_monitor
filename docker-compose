@@ -1,0 +1,30 @@
+Services:
+  nodeseek-monitor:
+    build: .
+    # 或者构建后推镜像, 用 image: your/nodeseek-monitor:latest
+    container_name: nodeseek-monitor
+    restart: unless-stopped
+    environment:
+      # 必填
+      TG_BOT_TOKEN: "${TG_BOT_TOKEN}"
+      ALLOWED_USER_IDS: "${ALLOWED_USER_IDS}"     # 白名单, 逗号分隔, 如 123456,789012
+      # 可选: 首次启动的初始值, 之后以 /add /del 等命令为准
+      TG_CHAT_ID: "${TG_CHAT_ID:-}"               # 不填就用 /open 命令自动绑定
+      KEYWORDS: "${KEYWORDS:-}"                   # 初始关键词, 逗号分隔
+      EXCLUDES: "${EXCLUDES:-}"                   # 初始排除词, 逗号分隔
+      INTERVAL: "${INTERVAL:-120}"
+      CATEGORY: "交易"
+      # HTTPS_PROXY: "http://host.docker.internal:7890"  # 国内机 TG 打不通时用
+    volumes:
+      - ./data:/data
+    # 2C2G 小鸡再叠服务, 限一下资源更稳
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.3"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
