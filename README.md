@@ -6,103 +6,60 @@
 
 - 标题 + 正文同时匹配，多关键词 OR
 - 排除词过滤（优先级高于关键词）
-- TG 命令动态增删关键词，不用改配置重启
+- TG 命令动态增删关键词，改完即时生效
 - 白名单保护，只允许指定 TG 用户发命令
 - 配置和去重记录持久化，重启不丢
-- 轻量：运行内存 30-50MB，2C2G 小鸡无压力
+- 轻量：运行内存 30-50MB，小鸡无压力
 
 ## 准备工作
 
-1. **创建 Bot**：Telegram 里找 `@BotFather` → `/newbot` → 拿到 `TG_BOT_TOKEN`
-1. **拿 user_id**：给 `@userinfobot` 发任意消息，记下返回的 `Id`（自己和朋友的都要，用于白名单）
+1. **创建 Bot**：Telegram 找 `@BotFather` → `/newbot` → 拿到 `TG_BOT_TOKEN`
+1. **拿 user_id**：给 `@userinfobot` 发任意消息，记下返回的 `Id`（自己和朋友的都要）
 
-## 部署方式一：使用预构建镜像（推荐）
+## 部署
 
-GitHub Actions 已自动构建好镜像推到 GHCR，直接拉取即可。
-
-在 VPS 上创建目录和文件：
+### 1. 一键拉取配置文件
 
 ```bash
-mkdir nodeseek-monitor && cd nodeseek-monitor
+mkdir -p nodeseek-monitor && cd nodeseek-monitor && \
+wget -O docker-compose.yml https://raw.githubusercontent.com/merlin-node/ns_monitor/main/docker-compose.yml && \
+wget -O .env https://raw.githubusercontent.com/merlin-node/ns_monitor/main/.env.example
 ```
 
-创建 `docker-compose.yml`：
-
-```yaml
-services:
-  nodeseek-monitor:
-    image: ghcr.io/merlin-node/ns_monitor:latest
-    container_name: nodeseek-monitor
-    restart: unless-stopped
-    environment:
-      TG_BOT_TOKEN: "${TG_BOT_TOKEN}"
-      ALLOWED_USER_IDS: "${ALLOWED_USER_IDS}"
-      TG_CHAT_ID: "${TG_CHAT_ID:-}"
-      KEYWORDS: "${KEYWORDS:-}"
-      EXCLUDES: "${EXCLUDES:-}"
-      INTERVAL: "${INTERVAL:-120}"
-      CATEGORY: "交易"
-    volumes:
-      - ./data:/data
-    deploy:
-      resources:
-        limits:
-          memory: 128M
-          cpus: "0.3"
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "3"
-```
-
-创建 `.env`：
+### 2. 编辑 `.env` 填入你自己的信息
 
 ```bash
-TG_BOT_TOKEN=1234567890:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-ALLOWED_USER_IDS=123456789,987654321
-TG_CHAT_ID=
-KEYWORDS=甲骨文,oracle,4837
-EXCLUDES=求购,收购
-INTERVAL=120
+nano .env
 ```
 
-启动：
+> 如果系统没装 nano：`apt install -y nano` (Debian/Ubuntu) 或 `yum install -y nano` (CentOS)。
+> nano 操作：方向键移动，直接打字编辑，`Ctrl+O` 保存（回车确认），`Ctrl+X` 退出。
+
+至少要改这两项：
+
+```
+TG_BOT_TOKEN=刚才BotFather给你的token
+ALLOWED_USER_IDS=你的user_id1,你的user_id2
+```
+
+其他的 `KEYWORDS`、`EXCLUDES`、`INTERVAL` 可以先留空或随便填，之后都能用 TG 命令改。
+
+### 3. 启动
 
 ```bash
-docker compose pull
 docker compose up -d
 docker compose logs -f
 ```
 
-更新镜像：
+### 4. 绑定推送目标
 
-```bash
-docker compose pull && docker compose up -d
-```
+TG 里找到你的 bot，发送 `/open`，它会自动把当前聊天设为推送目标。然后发 `/status` 确认运行正常。
 
-> 如果 `docker pull` 报权限错误，去 GitHub 仓库右侧 Packages → 点进镜像 → Package settings → 拉到底把 Visibility 改成 **Public**。
-
-## 部署方式二：本地构建
-
-```bash
-git clone https://github.com/merlin-node/ns_monitor.git
-cd ns_monitor
-cp .env.example .env
-vim .env    # 填 TG_BOT_TOKEN 和 ALLOWED_USER_IDS
-docker compose up -d --build
-```
-
-此时 `docker-compose.yml` 里要把 `image:` 那行改成 `build: .`。
-
-## 首次使用
-
-启动后给你的 bot 发 `/open`，它会自动把当前聊天设为推送目标。之后所有配置都可以通过 TG 命令改，改完即时生效，重启容器也不会丢（配置存在 `./data/config.json`）。
-
-## 命令列表
+## 常用命令
 
 ```
 /help        查看帮助
+/status      查看当前状态
 /chat_id     查看当前 chat_id
 /add 词      添加关键词
 /del 词      删除关键词
@@ -115,32 +72,56 @@ docker compose up -d --build
 /interval N  设置轮询间隔(秒, 最小 30)
 /open        开启提醒（并绑定当前聊天）
 /close       关闭提醒
-/status      查看当前状态
 ```
 
 非白名单用户发命令会被拒绝并记录日志。
+
+## 维护
+
+**更新镜像到最新版：**
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+**查看日志：**
+
+```bash
+docker compose logs -f
+```
+
+**重置去重记录（会把当前 RSS 里的新帖当”已见过”）：**
+
+```bash
+docker compose down
+rm -f data/seen.json
+docker compose up -d
+```
+
+**彻底重置配置：**
+
+```bash
+docker compose down
+rm -rf data/
+docker compose up -d
+```
 
 ## 常见问题
 
 **收不到消息？**
 
 - `docker compose logs -f` 看报错
-- 发 `/status` 确认开关开启且 `chat_id` 不为空
-- 日志报 `TG sendMessage 失败`，说明机器访问不到 `api.telegram.org`，在 compose 的 environment 里加一行 `HTTPS_PROXY: "http://你的代理:端口"` 即可
+- 发 `/status` 确认开关是开启且 `chat_id` 不为空
+- 日志报 `TG sendMessage 失败` 说明机器访问不到 `api.telegram.org`，在 `.env` 里加一行 `HTTPS_PROXY=http://你的代理:端口`
 
-**匹配太多或太少？**
+**匹配规则？**
 
-- 匹配对象是标题 + 正文摘要，不区分大小写
+- 标题 + 正文摘要一起匹配，不区分大小写
 - 多关键词是 OR 关系，命中任一即推送
 - 排除词优先级高于关键词，命中任一排除词直接丢弃
 
-**想重置去重记录？**
-停容器，删 `./data/seen.json`，重启即可。首次启动不会推历史帖，只记录当前 RSS 里已有的 ID，下次轮询起推新增的。
-
-**怎么更新？**
-
-- 只改 `.env`：`docker compose up -d`（会自动重启）
-- 改了代码并 push 到 main：等 Actions 构建完后 `docker compose pull && docker compose up -d`
+**不想开机启动？**
+把 `docker-compose.yml` 里的 `restart: unless-stopped` 改成 `restart: "no"`。
 
 ## 资源占用参考
 
