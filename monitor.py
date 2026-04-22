@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """NodeSeek 关键词监控 -> Telegram Bot (NsAlert)
-功能:
-  - 标题 + 内容匹配, 多关键词 OR
-  - 排除词过滤
-  - 多板块订阅
-  - 白名单保护
-  - 内联按钮菜单 (/menu)
-  - 配置/去重持久化
+纯面板版:
+  - 输入框左下角持久化菜单按钮 -> 弹出控制面板
+  - 所有操作通过内联按钮完成
+  - 文字命令已废弃 (仅保留 /menu /start /cancel)
 """
 import os
 import re
@@ -70,9 +67,7 @@ log = logging.getLogger("nsmon")
 
 # ========== 配置管理 ==========
 _lock = threading.Lock()
-
-# 用户"等待输入"状态
-_pending = {}
+_pending = {}  # user_id -> {"action": ..., "chat_id": ..., "menu_msg_id": ...}
 
 def _default_cfg():
     return {
@@ -116,7 +111,7 @@ def save_seen(seen):
 config = load_config()
 seen   = load_seen()
 
-# ========== Telegram ==========
+# ========== Telegram API ==========
 def tg_call(method, **params):
     if not TG_TOKEN:
         log.error("no TG_BOT_TOKEN")
@@ -159,6 +154,16 @@ def tg_answer_cb(cb_id, text=None):
     if text:
         params["text"] = text
     return tg_call("answerCallbackQuery", **params)
+
+def setup_tg_ui():
+    """注册菜单按钮 + 命令列表 (启动时调用一次)"""
+    # 菜单按钮 (输入框左边): 点击后展示 commands 列表
+    tg_call("setChatMenuButton", menu_button={"type": "commands"})
+    # 只注册一个 /menu, 避免命令列表里出现一堆已废弃的命令
+    tg_call("setMyCommands", commands=[
+        {"command": "menu", "description": "🎯 打开 NsAlert 控制面板"},
+    ])
+    log.info("TG UI registered")
 
 # ========== 匹配逻辑 ==========
 TAG_RE = re.compile(r"<[^>]+>")
@@ -248,7 +253,7 @@ def poll_once():
     if new_hits:
         log.info("pushed %d new posts", new_hits)
 
-# ========== 工具函数 ==========
+# ========== 工具 ==========
 def fmt_list(items):
     return "、".join(items) if items else "(空)"
 
@@ -264,7 +269,7 @@ def fmt_boards(subscribed):
 def is_allowed(user_id):
     return (not ALLOWED_IDS) or (user_id in ALLOWED_IDS)
 
-# ========== 菜单视图 ==========
+# ========== 面板视图 ==========
 def kb(rows):
     return {"inline_keyboard": rows}
 
@@ -289,7 +294,7 @@ def view_main():
         [toggle_btn, btn("📊 刷新状态", "main")],
         [btn("📋 关键词管理", "menu_keys"), btn("🚫 排除词管理", "menu_ex")],
         [btn("📑 板块订阅", "menu_boards"), btn("⚙️ 间隔设置", "menu_interval")],
-        [btn("❓ 帮助", "menu_help")],
+        [btn("📖 说明书", "menu_guide")],
     ])
     return text, markup
 
@@ -403,28 +408,25 @@ def view_interval():
     ])
     return text, markup
 
-def view_help():
+def view_guide():
     text = (
-        "❓ <b>使用帮助</b>\n\n"
-        "<b>基本概念</b>\n"
-        "• <b>关键词</b>: 标题或内容包含任一关键词即推送\n"
-        "• <b>排除词</b>: 命中任一排除词的帖子直接丢弃\n"
-        "• <b>板块订阅</b>: 只扫描订阅板块, 空=全站\n\n"
-        "<b>常用命令</b> (按钮用不惯可以发命令)\n"
-        "/menu - 打开控制面板\n"
-        "/status - 查看状态\n"
-        "/open - 开启提醒\n"
-        "/close - 关闭提醒\n"
-        "/add 词 - 添加关键词\n"
-        "/del 词 - 删除关键词\n"
-        "/add_ex 词 - 添加排除词\n"
-        "/interval N - 设置间隔(最小10)\n\n"
-        "<b>板块代号</b>\n"
-        "<code>trade</code>=交易 <code>daily</code>=日常 <code>tech</code>=技术\n"
-        "<code>info</code>=情报 <code>review</code>=测评 <code>dev</code>=Dev\n"
-        "<code>carpool</code>=拼车 <code>promotion</code>=推广\n"
-        "<code>life</code>=生活 <code>photo</code>=贴图 <code>expose</code>=曝光\n"
-        "<code>meaningless</code>=无意义 <code>sandbox</code>=沙盒"
+        "📖 <b>NsAlert 使用说明</b>\n\n"
+        "<b>━━━ 这是什么 ━━━</b>\n"
+        "自动监控 NodeSeek 新帖, 命中关键词就推送到你的 TG, 适合抢鸡、找货、盯交易。\n\n"
+        "<b>━━━ 快速上手 ━━━</b>\n"
+        "<b>1.</b> 点 <b>[📋 关键词管理]</b> 添加你关心的词\n"
+        "  例: <code>cloudcone</code>、<code>甲骨文</code>、<code>香港</code>\n"
+        "<b>2.</b> 点 <b>[🚫 排除词]</b> 过滤噪音\n"
+        "  例: <code>求购</code>、<code>测评</code>、<code>中盘</code>\n"
+        "<b>3.</b> 点 <b>[📑 板块订阅]</b> 选板块\n"
+        "  默认 <code>trade</code> (交易), 也可选全站\n"
+        "<b>4.</b> 点 <b>[🔔 开启提醒]</b> 就开始工作了\n\n"
+        "<b>━━━ 匹配规则 ━━━</b>\n"
+        "• 标题 + 内容同时搜索\n"
+        "• 不区分大小写\n"
+        "• 多个关键词是<b>或</b>关系 (命中任一即推送)\n"
+        "• 排除词优先级高于关键词\n"
+        "• 间隔 10-300 秒, 建议 60 秒"
     )
     markup = kb([[btn("⬅️ 返回主菜单", "main")]])
     return text, markup
@@ -466,8 +468,8 @@ def handle_callback(cb):
         new_view = view_boards()
     elif action == "menu_interval":
         new_view = view_interval()
-    elif action == "menu_help":
-        new_view = view_help()
+    elif action == "menu_guide":
+        new_view = view_guide()
     elif action == "del_key_list":
         new_view = view_del_key_list()
     elif action == "del_ex_list":
@@ -591,8 +593,8 @@ def handle_callback(cb):
         text, markup = new_view
         tg_edit(chat_id, msg_id, text, markup)
 
-# ========== 文字命令处理 ==========
-def handle_command(msg):
+# ========== 消息处理 (仅 /menu /start /cancel + pending 输入) ==========
+def handle_message(msg):
     text = (msg.get("text") or "").strip()
     chat    = msg.get("chat", {})
     chat_id = chat.get("id")
@@ -603,7 +605,7 @@ def handle_command(msg):
         tg_send(chat_id, "⛔ 你没有使用此机器人的权限")
         return
 
-    # 处理 pending 输入
+    # 1. pending 输入 (用户在添加关键词/自定义间隔等场景下发送的文字)
     if user_id in _pending and not text.startswith("/"):
         p = _pending.pop(user_id)
         action = p["action"]
@@ -656,12 +658,14 @@ def handle_command(msg):
             tg_edit(chat_id, menu_msg_id, next_view[0], next_view[1])
         return
 
+    # 2. 非命令消息直接忽略 (或提示)
     if not text.startswith("/"):
+        # 用户随便打字发过来, 提示用面板
+        tg_send(chat_id, "👉 请点输入框左边的菜单按钮, 或发送 /menu 打开控制面板")
         return
 
-    parts = text.split(maxsplit=1)
-    cmd = parts[0].split("@")[0].lower()
-    arg = parts[1].strip() if len(parts) > 1 else ""
+    # 3. 命令
+    cmd = text.split()[0].split("@")[0].lower()
 
     if cmd == "/cancel":
         if user_id in _pending:
@@ -676,147 +680,8 @@ def handle_command(msg):
         tg_send(chat_id, t, reply_markup=markup)
         return
 
-    if cmd == "/help":
-        t, markup = view_help()
-        tg_send(chat_id, t, reply_markup=markup)
-        return
-
-    if cmd == "/chat_id":
-        tg_send(chat_id, f"当前 chat_id: <code>{chat_id}</code>\n你的 user_id: <code>{user_id}</code>")
-        return
-
-    # 传统文字命令
-    with _lock:
-        cfg = config
-        changed = False
-        reply = None
-
-        if cmd == "/add":
-            if not arg:
-                reply = "用法: /add 关键词"
-            elif arg in cfg["keywords"]:
-                reply = f"关键词已存在: {arg}"
-            else:
-                cfg["keywords"].append(arg)
-                changed = True
-                reply = f"✅ 已添加: {arg}\n当前: {fmt_list(cfg['keywords'])}"
-        elif cmd == "/del":
-            if arg in cfg["keywords"]:
-                cfg["keywords"].remove(arg)
-                changed = True
-                reply = f"✅ 已删除: {arg}"
-            else:
-                reply = f"未找到: {arg}"
-        elif cmd == "/keys":
-            reply = f"📋 关键词: {fmt_list(cfg['keywords'])}"
-        elif cmd == "/clear_keys":
-            cfg["keywords"] = []
-            changed = True
-            reply = "✅ 已清空关键词"
-        elif cmd == "/add_ex":
-            if not arg:
-                reply = "用法: /add_ex 排除词"
-            elif arg in cfg["excludes"]:
-                reply = f"排除词已存在: {arg}"
-            else:
-                cfg["excludes"].append(arg)
-                changed = True
-                reply = f"✅ 已添加: {arg}"
-        elif cmd == "/del_ex":
-            if arg in cfg["excludes"]:
-                cfg["excludes"].remove(arg)
-                changed = True
-                reply = f"✅ 已删除: {arg}"
-            else:
-                reply = f"未找到: {arg}"
-        elif cmd == "/ex_keys":
-            reply = f"🚫 排除词: {fmt_list(cfg['excludes'])}"
-        elif cmd == "/clear_ex":
-            cfg["excludes"] = []
-            changed = True
-            reply = "✅ 已清空排除词"
-        elif cmd == "/boards":
-            t, markup = view_boards()
-            tg_send(chat_id, t, reply_markup=markup)
-            return
-        elif cmd == "/add_board":
-            if not arg:
-                reply = "用法: /add_board trade 或 /add_board all"
-            elif arg == "all":
-                cfg["boards"] = []
-                changed = True
-                reply = "✅ 已切换为全站抓取"
-            elif arg in BOARDS:
-                subs = cfg.setdefault("boards", [])
-                if not subs:
-                    cfg["boards"] = [arg]
-                    changed = True
-                    reply = f"✅ 已关闭全站, 只订阅 {arg}"
-                elif arg in subs:
-                    reply = f"已在订阅: {arg}"
-                else:
-                    subs.append(arg)
-                    changed = True
-                    reply = f"✅ 已添加: {arg}"
-            else:
-                reply = f"未知板块: {arg}"
-        elif cmd == "/del_board":
-            if arg not in BOARDS:
-                reply = f"未知板块: {arg}"
-            else:
-                subs = cfg.setdefault("boards", [])
-                if not subs:
-                    reply = "当前是全站模式"
-                elif arg in subs:
-                    subs.remove(arg)
-                    changed = True
-                    reply = f"✅ 已删除: {arg}"
-                else:
-                    reply = f"未订阅: {arg}"
-        elif cmd == "/clear_boards":
-            cfg["boards"] = []
-            changed = True
-            reply = "✅ 已切换为全站抓取"
-        elif cmd == "/interval":
-            try:
-                n = int(arg)
-                if n < 10:
-                    reply = "⚠️ 不能小于 10 秒"
-                else:
-                    cfg["interval"] = n
-                    changed = True
-                    reply = f"✅ 已设为 {n} 秒"
-            except ValueError:
-                reply = "用法: /interval 120"
-        elif cmd == "/open":
-            cfg["enabled"] = True
-            if str(cfg.get("chat_id")) != str(chat_id):
-                cfg["chat_id"] = str(chat_id)
-            changed = True
-            reply = f"✅ 提醒已开启\nchat_id: <code>{cfg['chat_id']}</code>"
-        elif cmd == "/close":
-            cfg["enabled"] = False
-            changed = True
-            reply = "🔕 提醒已关闭"
-        elif cmd == "/status":
-            reply = (
-                f"<b>运行状态</b>\n"
-                f"开关: {'🟢 开启' if cfg['enabled'] else '🔴 关闭'}\n"
-                f"chat_id: <code>{cfg.get('chat_id') or '(未设置)'}</code>\n"
-                f"间隔: {cfg['interval']} 秒\n"
-                f"板块: {fmt_boards(cfg.get('boards') or [])}\n"
-                f"关键词 ({len(cfg['keywords'])}): {fmt_list(cfg['keywords'])}\n"
-                f"排除词 ({len(cfg['excludes'])}): {fmt_list(cfg['excludes'])}\n"
-                f"已去重: {len(seen)} 条"
-            )
-        else:
-            reply = "未知命令, 发送 /menu 打开控制面板"
-
-        if changed:
-            save_config(cfg)
-
-    if reply:
-        tg_send(chat_id, reply)
+    # 其他命令一律提示用面板
+    tg_send(chat_id, "该命令已废弃, 请点输入框左边的菜单按钮, 或发送 /menu 打开控制面板")
 
 # ========== TG long polling ==========
 def tg_updates_loop():
@@ -845,9 +710,9 @@ def tg_updates_loop():
                 msg = upd.get("message") or upd.get("edited_message")
                 if msg:
                     try:
-                        handle_command(msg)
+                        handle_message(msg)
                     except Exception as e:
-                        log.exception("handle_command error: %s", e)
+                        log.exception("handle_message error: %s", e)
         except Exception as e:
             log.warning("getUpdates error: %s", e)
             time.sleep(5)
@@ -890,6 +755,12 @@ def main():
     board_info = "all" if not boards else ",".join(boards)
     log.info("NsAlert start, boards=%s, interval=%ds, keys=%s, excludes=%s",
              board_info, config["interval"], config["keywords"], config["excludes"])
+
+    # 注册 TG 菜单按钮 + 命令列表
+    try:
+        setup_tg_ui()
+    except Exception as e:
+        log.warning("setup_tg_ui failed: %s", e)
 
     t = threading.Thread(target=tg_updates_loop, daemon=True)
     t.start()
