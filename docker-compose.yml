@@ -1,6 +1,6 @@
 services:
   nodeseek-monitor:
-    build: .
+    image: ghcr.io/merlin-node/ns_monitor:latest
     container_name: nodeseek-monitor
     restart: unless-stopped
     env_file:
