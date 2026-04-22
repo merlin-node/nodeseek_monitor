@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""NodeSeek 交易区关键词监控 -> Telegram Bot
+"""NodeSeek 关键词监控 -> Telegram Bot (NsAlert)
 功能:
   - 标题 + 内容匹配, 多关键词 OR
   - 排除词过滤
-  - TG 命令动态管理 (白名单保护)
+  - 多板块订阅
+  - 白名单保护
+  - 内联按钮菜单 (/menu)
   - 配置/去重持久化
 """
 import os
@@ -19,21 +21,19 @@ from pathlib import Path
 import feedparser
 import requests
 
-# ========== 启动配置 (仅首次启动用, 之后以 config.json 为准) ==========
+# ========== 启动配置 ==========
 RSS_URL       = os.getenv("RSS_URL", "https://rss.nodeseek.com/")
-CATEGORY      = os.getenv("CATEGORY", "trade")
 TG_TOKEN      = os.getenv("TG_BOT_TOKEN", "").strip()
 PROXY         = os.getenv("HTTPS_PROXY", "").strip()
 DATA_DIR      = Path(os.getenv("DATA_DIR", "/data"))
 
-# 白名单: 逗号分隔的 TG 用户 ID, 只有这些人能发命令
 ALLOWED_IDS   = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
 
-# 初始值
 INIT_CHAT_ID  = os.getenv("TG_CHAT_ID", "").strip()
 INIT_KEYS     = [k.strip() for k in os.getenv("KEYWORDS", "").split(",") if k.strip()]
 INIT_EXCLUDES = [k.strip() for k in os.getenv("EXCLUDES", "").split(",") if k.strip()]
 INIT_INTERVAL = int(os.getenv("INTERVAL", "120"))
+INIT_BOARDS   = [b.strip() for b in os.getenv("BOARDS", "trade").split(",") if b.strip()]
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = DATA_DIR / "config.json"
@@ -43,6 +43,24 @@ MAX_SEEN    = 500
 TG_API  = f"https://api.telegram.org/bot{TG_TOKEN}"
 PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
 
+BOARDS = {
+    "trade":       "交易",
+    "daily":       "日常",
+    "tech":        "技术",
+    "info":        "情报",
+    "review":      "测评",
+    "dev":         "Dev",
+    "carpool":     "拼车",
+    "promotion":   "推广",
+    "life":        "生活",
+    "photo":       "贴图",
+    "expose":      "曝光",
+    "meaningless": "无意义",
+    "sandbox":     "沙盒",
+}
+
+INTERVAL_PRESETS = [10, 30, 60, 120, 300]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -50,8 +68,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("nsmon")
 
-# ========== 配置管理 (线程安全) ==========
+# ========== 配置管理 ==========
 _lock = threading.Lock()
+
+# 用户"等待输入"状态
+_pending = {}
 
 def _default_cfg():
     return {
@@ -60,6 +81,7 @@ def _default_cfg():
         "excludes": INIT_EXCLUDES,
         "interval": INIT_INTERVAL,
         "enabled":  True,
+        "boards":   list(INIT_BOARDS),
     }
 
 def load_config():
@@ -68,7 +90,9 @@ def load_config():
         try:
             cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
         except Exception as e:
-            log.warning("config.json 损坏, 使用默认: %s", e)
+            log.warning("config.json loads failed: %s", e)
+    if "boards" not in cfg:
+        cfg["boards"] = list(INIT_BOARDS)
     return cfg
 
 def save_config(cfg):
@@ -95,26 +119,46 @@ seen   = load_seen()
 # ========== Telegram ==========
 def tg_call(method, **params):
     if not TG_TOKEN:
-        log.error("未设置 TG_BOT_TOKEN")
+        log.error("no TG_BOT_TOKEN")
         return None
     try:
         r = requests.post(f"{TG_API}/{method}", json=params, timeout=70, proxies=PROXIES)
         data = r.json()
         if not data.get("ok"):
-            log.warning("TG %s 失败: %s", method, data)
+            log.warning("TG %s failed: %s", method, data)
         return data
     except Exception as e:
-        log.warning("TG %s 异常: %s", method, e)
+        log.warning("TG %s error: %s", method, e)
         return None
 
-def tg_send(chat_id, text, disable_preview=False):
-    return tg_call(
-        "sendMessage",
-        chat_id=chat_id,
-        text=text,
-        parse_mode="HTML",
-        disable_web_page_preview=disable_preview,
-    )
+def tg_send(chat_id, text, reply_markup=None, disable_preview=True):
+    params = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": disable_preview,
+    }
+    if reply_markup is not None:
+        params["reply_markup"] = reply_markup
+    return tg_call("sendMessage", **params)
+
+def tg_edit(chat_id, message_id, text, reply_markup=None):
+    params = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup is not None:
+        params["reply_markup"] = reply_markup
+    return tg_call("editMessageText", **params)
+
+def tg_answer_cb(cb_id, text=None):
+    params = {"callback_query_id": cb_id}
+    if text:
+        params["text"] = text
+    return tg_call("answerCallbackQuery", **params)
 
 # ========== 匹配逻辑 ==========
 TAG_RE = re.compile(r"<[^>]+>")
@@ -127,7 +171,6 @@ def clean_text(s):
     return re.sub(r"\s+", " ", s).strip()
 
 def match(title, content, keywords, excludes):
-    """标题+内容做不区分大小写的 OR 匹配, 命中任一排除词则丢弃"""
     hay = (title + "\n" + content).lower()
     if excludes and any(ex.lower() in hay for ex in excludes):
         return False
@@ -135,17 +178,16 @@ def match(title, content, keywords, excludes):
         return False
     return any(kw.lower() in hay for kw in keywords)
 
-def entry_in_category(entry, category):
+def entry_board(entry):
     tags = entry.get("tags", []) or []
     for t in tags:
         term = (t.get("term") or "").strip()
-        if term == category:
-            return True
-    # 兜底: 有些 feed 把分类放在 category 字段
+        if term:
+            return term
     cat = entry.get("category")
-    if isinstance(cat, str) and cat.strip() == category:
-        return True
-    return False
+    if isinstance(cat, str):
+        return cat.strip()
+    return ""
 
 # ========== RSS 轮询 ==========
 def poll_once():
@@ -154,7 +196,7 @@ def poll_once():
     if not cfg["enabled"]:
         return
     if not cfg["chat_id"]:
-        return  # 还没绑定接收者
+        return
 
     try:
         r = requests.get(RSS_URL, timeout=30, proxies=PROXIES,
@@ -162,21 +204,22 @@ def poll_once():
         r.raise_for_status()
         feed = feedparser.parse(r.content)
     except Exception as e:
-        log.warning("拉取 RSS 失败: %s", e)
+        log.warning("fetch RSS failed: %s", e)
         return
 
+    subscribed = cfg.get("boards") or []
     new_hits = 0
-    # RSS 通常按时间倒序, 反过来处理以便旧的先推
+
     for entry in reversed(feed.entries):
         pid = entry.get("id") or entry.get("link")
         if not pid or pid in seen:
             continue
-
-        # 先占位, 即使后面没命中也不再重复检查
         seen.append(pid)
 
-        if not entry_in_category(entry, CATEGORY):
-            continue
+        if subscribed:
+            board = entry_board(entry)
+            if board not in subscribed:
+                continue
 
         title   = clean_text(entry.get("title", ""))
         content = clean_text(entry.get("summary", "") or entry.get("description", ""))
@@ -184,74 +227,471 @@ def poll_once():
         if not match(title, content, cfg["keywords"], cfg["excludes"]):
             continue
 
-        link   = entry.get("link", "")
-        author = entry.get("author", "未知")
-        snippet = content[:200] + ("..." if len(content) > 200 else "")
+        link     = entry.get("link", "")
+        author   = entry.get("author", "unknown")
+        board    = entry_board(entry)
+        board_zh = BOARDS.get(board, board)
+        snippet  = content[:200] + ("..." if len(content) > 200 else "")
+
         msg = (
-            f"🔔 <b>NodeSeek · {CATEGORY}</b>\n\n"
+            f"🔔 <b>NodeSeek · {html.escape(board_zh)}</b>\n\n"
             f"<b>{html.escape(title)}</b>\n"
             f"👤 {html.escape(author)}\n\n"
             f"{html.escape(snippet)}\n\n"
             f"🔗 <a href=\"{html.escape(link)}\">查看原帖</a>"
         )
-        tg_send(cfg["chat_id"], msg)
+        tg_send(cfg["chat_id"], msg, disable_preview=False)
         new_hits += 1
-        time.sleep(0.5)  # 避免触发 TG 限流
+        time.sleep(0.5)
 
     save_seen(seen)
     if new_hits:
-        log.info("推送 %d 条新帖", new_hits)
+        log.info("pushed %d new posts", new_hits)
 
-# ========== TG 命令处理 ==========
-HELP_TEXT = (
-    "<b>可用命令</b>\n"
-    "/help - 查看帮助\n"
-    "/chat_id - 查看当前 chat_id\n"
-    "/add 关键词 - 添加订阅关键词\n"
-    "/del 关键词 - 删除关键词\n"
-    "/keys - 查看关键词\n"
-    "/clear_keys - 清空关键词\n"
-    "/add_ex 排除词 - 添加排除词\n"
-    "/del_ex 排除词 - 删除排除词\n"
-    "/ex_keys - 查看排除词\n"
-    "/clear_ex - 清空排除词\n"
-    "/interval 秒数 - 设置轮询间隔\n"
-    "/open - 开启提醒\n"
-    "/close - 关闭提醒\n"
-    "/status - 查看当前状态"
-)
-
+# ========== 工具函数 ==========
 def fmt_list(items):
     return "、".join(items) if items else "(空)"
 
+def fmt_boards(subscribed):
+    if not subscribed:
+        return "全站"
+    parts = []
+    for code in subscribed:
+        zh = BOARDS.get(code, code)
+        parts.append(f"{code}({zh})")
+    return "、".join(parts)
+
+def is_allowed(user_id):
+    return (not ALLOWED_IDS) or (user_id in ALLOWED_IDS)
+
+# ========== 菜单视图 ==========
+def kb(rows):
+    return {"inline_keyboard": rows}
+
+def btn(text, data):
+    return {"text": text, "callback_data": data}
+
+def view_main():
+    with _lock:
+        cfg = dict(config)
+    status_emoji = "🟢" if cfg["enabled"] else "🔴"
+    status_text  = "开启" if cfg["enabled"] else "关闭"
+    board_text   = fmt_boards(cfg.get("boards") or [])
+    text = (
+        "🎯 <b>NsAlert 控制面板</b>\n\n"
+        f"状态: {status_emoji} {status_text}　 间隔: {cfg['interval']}秒\n"
+        f"关键词: {len(cfg['keywords'])} 个　 排除词: {len(cfg['excludes'])} 个\n"
+        f"板块: {board_text}\n"
+        f"已去重: {len(seen)} 条"
+    )
+    toggle_btn = btn("🔕 关闭提醒", "toggle_enabled") if cfg["enabled"] else btn("🔔 开启提醒", "toggle_enabled")
+    markup = kb([
+        [toggle_btn, btn("📊 刷新状态", "main")],
+        [btn("📋 关键词管理", "menu_keys"), btn("🚫 排除词管理", "menu_ex")],
+        [btn("📑 板块订阅", "menu_boards"), btn("⚙️ 间隔设置", "menu_interval")],
+        [btn("❓ 帮助", "menu_help")],
+    ])
+    return text, markup
+
+def view_keys():
+    with _lock:
+        cfg = dict(config)
+    ks = cfg["keywords"]
+    text = "📋 <b>关键词管理</b>\n\n"
+    if ks:
+        text += f"当前 ({len(ks)} 个):\n"
+        text += "\n".join(f"• <code>{html.escape(k)}</code>" for k in ks)
+    else:
+        text += "(空) 请先添加关键词, 否则不会有推送"
+    markup = kb([
+        [btn("➕ 添加", "add_key"), btn("➖ 删除", "del_key_list")],
+        [btn("🗑️ 清空全部", "clear_keys_confirm")],
+        [btn("⬅️ 返回主菜单", "main")],
+    ])
+    return text, markup
+
+def view_del_key_list():
+    with _lock:
+        cfg = dict(config)
+    ks = cfg["keywords"]
+    text = "➖ <b>删除关键词</b>\n\n点击要删除的关键词:"
+    rows = []
+    for i in range(0, len(ks), 2):
+        row = [btn(f"❌ {ks[i]}", f"del_key|{ks[i]}")]
+        if i + 1 < len(ks):
+            row.append(btn(f"❌ {ks[i+1]}", f"del_key|{ks[i+1]}"))
+        rows.append(row)
+    if not ks:
+        text += "\n\n(空)"
+    rows.append([btn("⬅️ 返回", "menu_keys")])
+    return text, kb(rows)
+
+def view_ex():
+    with _lock:
+        cfg = dict(config)
+    exs = cfg["excludes"]
+    text = "🚫 <b>排除词管理</b>\n\n"
+    text += "命中任一排除词的帖子会被丢弃, 优先级高于关键词\n\n"
+    if exs:
+        text += f"当前 ({len(exs)} 个):\n"
+        text += "\n".join(f"• <code>{html.escape(k)}</code>" for k in exs)
+    else:
+        text += "(空)"
+    markup = kb([
+        [btn("➕ 添加", "add_ex"), btn("➖ 删除", "del_ex_list")],
+        [btn("🗑️ 清空全部", "clear_ex_confirm")],
+        [btn("⬅️ 返回主菜单", "main")],
+    ])
+    return text, markup
+
+def view_del_ex_list():
+    with _lock:
+        cfg = dict(config)
+    exs = cfg["excludes"]
+    text = "➖ <b>删除排除词</b>\n\n点击要删除的排除词:"
+    rows = []
+    for i in range(0, len(exs), 2):
+        row = [btn(f"❌ {exs[i]}", f"del_ex|{exs[i]}")]
+        if i + 1 < len(exs):
+            row.append(btn(f"❌ {exs[i+1]}", f"del_ex|{exs[i+1]}"))
+        rows.append(row)
+    if not exs:
+        text += "\n\n(空)"
+    rows.append([btn("⬅️ 返回", "menu_ex")])
+    return text, kb(rows)
+
+def view_boards():
+    with _lock:
+        cfg = dict(config)
+    subs = cfg.get("boards") or []
+    text = "📑 <b>板块订阅</b>\n\n"
+    if not subs:
+        text += "当前模式: <b>🌐 全站抓取</b>\n所有板块的新帖都会被扫描"
+    else:
+        text += f"已订阅 {len(subs)} 个板块: {fmt_boards(subs)}\n只扫描这些板块的新帖"
+    text += "\n\n点击切换订阅 (✅=已订阅):"
+
+    rows = []
+    codes = list(BOARDS.keys())
+    for i in range(0, len(codes), 2):
+        row = []
+        for j in range(2):
+            if i + j < len(codes):
+                code = codes[i + j]
+                zh   = BOARDS[code]
+                mark = "✅" if (not subs or code in subs) else "⬜"
+                row.append(btn(f"{mark} {code} {zh}", f"toggle_board|{code}"))
+        rows.append(row)
+    rows.append([btn("🌐 切换全站模式", "all_boards")])
+    rows.append([btn("⬅️ 返回主菜单", "main")])
+    return text, kb(rows)
+
+def view_interval():
+    with _lock:
+        cfg = dict(config)
+    cur = cfg["interval"]
+    text = (
+        "⚙️ <b>轮询间隔设置</b>\n\n"
+        f"当前: <b>{cur} 秒</b>\n\n"
+        "常用预设 (秒):"
+    )
+    row1 = [btn(f"{'✅ ' if cur==n else ''}{n}", f"set_interval|{n}") for n in INTERVAL_PRESETS]
+    markup = kb([
+        row1,
+        [btn("✏️ 自定义", "custom_interval")],
+        [btn("⬅️ 返回主菜单", "main")],
+    ])
+    return text, markup
+
+def view_help():
+    text = (
+        "❓ <b>使用帮助</b>\n\n"
+        "<b>基本概念</b>\n"
+        "• <b>关键词</b>: 标题或内容包含任一关键词即推送\n"
+        "• <b>排除词</b>: 命中任一排除词的帖子直接丢弃\n"
+        "• <b>板块订阅</b>: 只扫描订阅板块, 空=全站\n\n"
+        "<b>常用命令</b> (按钮用不惯可以发命令)\n"
+        "/menu - 打开控制面板\n"
+        "/status - 查看状态\n"
+        "/open - 开启提醒\n"
+        "/close - 关闭提醒\n"
+        "/add 词 - 添加关键词\n"
+        "/del 词 - 删除关键词\n"
+        "/add_ex 词 - 添加排除词\n"
+        "/interval N - 设置间隔(最小10)\n\n"
+        "<b>板块代号</b>\n"
+        "<code>trade</code>=交易 <code>daily</code>=日常 <code>tech</code>=技术\n"
+        "<code>info</code>=情报 <code>review</code>=测评 <code>dev</code>=Dev\n"
+        "<code>carpool</code>=拼车 <code>promotion</code>=推广\n"
+        "<code>life</code>=生活 <code>photo</code>=贴图 <code>expose</code>=曝光\n"
+        "<code>meaningless</code>=无意义 <code>sandbox</code>=沙盒"
+    )
+    markup = kb([[btn("⬅️ 返回主菜单", "main")]])
+    return text, markup
+
+def view_confirm(action, title):
+    text = f"⚠️ <b>{title}</b>\n\n此操作不可恢复, 确定继续吗?"
+    markup = kb([
+        [btn("✅ 确定", f"confirm|{action}"), btn("❌ 取消", "main")],
+    ])
+    return text, markup
+
+# ========== 回调处理 ==========
+def handle_callback(cb):
+    cb_id   = cb["id"]
+    data    = cb.get("data", "")
+    user_id = cb["from"]["id"]
+    msg     = cb.get("message") or {}
+    chat_id = msg.get("chat", {}).get("id")
+    msg_id  = msg.get("message_id")
+
+    if not is_allowed(user_id):
+        tg_answer_cb(cb_id, "⛔ 无权限")
+        return
+
+    parts = data.split("|", 1)
+    action = parts[0]
+    arg = parts[1] if len(parts) > 1 else ""
+
+    new_view = None
+    toast = None
+
+    if action == "main":
+        new_view = view_main()
+    elif action == "menu_keys":
+        new_view = view_keys()
+    elif action == "menu_ex":
+        new_view = view_ex()
+    elif action == "menu_boards":
+        new_view = view_boards()
+    elif action == "menu_interval":
+        new_view = view_interval()
+    elif action == "menu_help":
+        new_view = view_help()
+    elif action == "del_key_list":
+        new_view = view_del_key_list()
+    elif action == "del_ex_list":
+        new_view = view_del_ex_list()
+
+    elif action == "toggle_enabled":
+        with _lock:
+            config["enabled"] = not config["enabled"]
+            if config["enabled"] and not config.get("chat_id"):
+                config["chat_id"] = str(chat_id)
+            save_config(config)
+        toast = "已开启" if config["enabled"] else "已关闭"
+        new_view = view_main()
+
+    elif action == "toggle_board":
+        if arg in BOARDS:
+            with _lock:
+                subs = config.setdefault("boards", [])
+                if not subs:
+                    config["boards"] = [arg]
+                    toast = f"✅ 已关闭全站, 只订阅 {arg}"
+                elif arg in subs:
+                    subs.remove(arg)
+                    toast = f"⬜ 已取消 {arg}"
+                else:
+                    subs.append(arg)
+                    toast = f"✅ 已加入 {arg}"
+                save_config(config)
+        new_view = view_boards()
+
+    elif action == "all_boards":
+        with _lock:
+            config["boards"] = []
+            save_config(config)
+        toast = "🌐 已切换全站模式"
+        new_view = view_boards()
+
+    elif action == "set_interval":
+        try:
+            n = int(arg)
+            if n < 10:
+                toast = "⚠️ 不能小于 10 秒"
+            else:
+                with _lock:
+                    config["interval"] = n
+                    save_config(config)
+                toast = f"✅ 已设为 {n} 秒"
+        except ValueError:
+            toast = "参数错误"
+        new_view = view_interval()
+
+    elif action == "custom_interval":
+        _pending[user_id] = {"action": "set_interval", "chat_id": chat_id, "menu_msg_id": msg_id}
+        tg_answer_cb(cb_id)
+        tg_send(chat_id,
+                "✏️ 请发送数字 (秒, 最小 10), 例: <code>60</code>\n发 /cancel 取消")
+        return
+
+    elif action == "add_key":
+        _pending[user_id] = {"action": "add_key", "chat_id": chat_id, "menu_msg_id": msg_id}
+        tg_answer_cb(cb_id)
+        tg_send(chat_id,
+                "➕ 请发送要添加的<b>关键词</b>\n"
+                "标题或内容包含它即会被推送\n"
+                "发 /cancel 取消")
+        return
+
+    elif action == "add_ex":
+        _pending[user_id] = {"action": "add_ex", "chat_id": chat_id, "menu_msg_id": msg_id}
+        tg_answer_cb(cb_id)
+        tg_send(chat_id,
+                "➕ 请发送要添加的<b>排除词</b>\n"
+                "命中它的帖子会被丢弃\n"
+                "发 /cancel 取消")
+        return
+
+    elif action == "del_key":
+        with _lock:
+            if arg in config["keywords"]:
+                config["keywords"].remove(arg)
+                save_config(config)
+                toast = f"已删除: {arg}"
+            else:
+                toast = "已不存在"
+        new_view = view_del_key_list()
+
+    elif action == "del_ex":
+        with _lock:
+            if arg in config["excludes"]:
+                config["excludes"].remove(arg)
+                save_config(config)
+                toast = f"已删除: {arg}"
+            else:
+                toast = "已不存在"
+        new_view = view_del_ex_list()
+
+    elif action == "clear_keys_confirm":
+        new_view = view_confirm("clear_keys", "清空所有关键词")
+    elif action == "clear_ex_confirm":
+        new_view = view_confirm("clear_ex", "清空所有排除词")
+
+    elif action == "confirm":
+        if arg == "clear_keys":
+            with _lock:
+                config["keywords"] = []
+                save_config(config)
+            toast = "✅ 已清空关键词"
+            new_view = view_keys()
+        elif arg == "clear_ex":
+            with _lock:
+                config["excludes"] = []
+                save_config(config)
+            toast = "✅ 已清空排除词"
+            new_view = view_ex()
+
+    else:
+        toast = "未知操作"
+
+    tg_answer_cb(cb_id, toast)
+    if new_view:
+        text, markup = new_view
+        tg_edit(chat_id, msg_id, text, markup)
+
+# ========== 文字命令处理 ==========
 def handle_command(msg):
     text = (msg.get("text") or "").strip()
-    if not text.startswith("/"):
-        return
-    chat = msg["chat"]
-    chat_id = chat["id"]
+    chat    = msg.get("chat", {})
+    chat_id = chat.get("id")
     user_id = msg.get("from", {}).get("id")
 
-    # 白名单校验
-    if ALLOWED_IDS and user_id not in ALLOWED_IDS:
-        log.warning("拒绝非白名单用户 %s: %s", user_id, text)
+    if not is_allowed(user_id):
+        log.warning("deny user %s: %s", user_id, text)
         tg_send(chat_id, "⛔ 你没有使用此机器人的权限")
         return
 
+    # 处理 pending 输入
+    if user_id in _pending and not text.startswith("/"):
+        p = _pending.pop(user_id)
+        action = p["action"]
+        menu_msg_id = p.get("menu_msg_id")
+        value = text.strip()
+
+        toast_text = None
+        next_view = None
+
+        if action == "add_key":
+            with _lock:
+                if value in config["keywords"]:
+                    toast_text = f"已存在: {value}"
+                elif not value:
+                    toast_text = "内容为空"
+                else:
+                    config["keywords"].append(value)
+                    save_config(config)
+                    toast_text = f"✅ 已添加关键词: {value}"
+            next_view = view_keys()
+
+        elif action == "add_ex":
+            with _lock:
+                if value in config["excludes"]:
+                    toast_text = f"已存在: {value}"
+                elif not value:
+                    toast_text = "内容为空"
+                else:
+                    config["excludes"].append(value)
+                    save_config(config)
+                    toast_text = f"✅ 已添加排除词: {value}"
+            next_view = view_ex()
+
+        elif action == "set_interval":
+            try:
+                n = int(value)
+                if n < 10:
+                    toast_text = "⚠️ 不能小于 10 秒"
+                else:
+                    with _lock:
+                        config["interval"] = n
+                        save_config(config)
+                    toast_text = f"✅ 已设为 {n} 秒"
+            except ValueError:
+                toast_text = "请发送数字"
+            next_view = view_interval()
+
+        tg_send(chat_id, toast_text or "已完成")
+        if menu_msg_id and next_view:
+            tg_edit(chat_id, menu_msg_id, next_view[0], next_view[1])
+        return
+
+    if not text.startswith("/"):
+        return
+
     parts = text.split(maxsplit=1)
-    cmd = parts[0].split("@")[0].lower()  # 去掉 @BotName
+    cmd = parts[0].split("@")[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
+    if cmd == "/cancel":
+        if user_id in _pending:
+            _pending.pop(user_id)
+            tg_send(chat_id, "已取消")
+        else:
+            tg_send(chat_id, "当前没有待输入操作")
+        return
+
+    if cmd in ("/menu", "/start"):
+        t, markup = view_main()
+        tg_send(chat_id, t, reply_markup=markup)
+        return
+
+    if cmd == "/help":
+        t, markup = view_help()
+        tg_send(chat_id, t, reply_markup=markup)
+        return
+
+    if cmd == "/chat_id":
+        tg_send(chat_id, f"当前 chat_id: <code>{chat_id}</code>\n你的 user_id: <code>{user_id}</code>")
+        return
+
+    # 传统文字命令
     with _lock:
-        cfg = config  # 直接改共享引用
+        cfg = config
         changed = False
         reply = None
 
-        if cmd == "/help":
-            reply = HELP_TEXT
-        elif cmd == "/chat_id":
-            reply = f"当前 chat_id: <code>{chat_id}</code>\n你的 user_id: <code>{user_id}</code>"
-        elif cmd == "/add":
+        if cmd == "/add":
             if not arg:
                 reply = "用法: /add 关键词"
             elif arg in cfg["keywords"]:
@@ -259,14 +699,14 @@ def handle_command(msg):
             else:
                 cfg["keywords"].append(arg)
                 changed = True
-                reply = f"✅ 已添加关键词: {arg}\n当前: {fmt_list(cfg['keywords'])}"
+                reply = f"✅ 已添加: {arg}\n当前: {fmt_list(cfg['keywords'])}"
         elif cmd == "/del":
             if arg in cfg["keywords"]:
                 cfg["keywords"].remove(arg)
                 changed = True
-                reply = f"✅ 已删除关键词: {arg}"
+                reply = f"✅ 已删除: {arg}"
             else:
-                reply = f"未找到关键词: {arg}"
+                reply = f"未找到: {arg}"
         elif cmd == "/keys":
             reply = f"📋 关键词: {fmt_list(cfg['keywords'])}"
         elif cmd == "/clear_keys":
@@ -281,38 +721,79 @@ def handle_command(msg):
             else:
                 cfg["excludes"].append(arg)
                 changed = True
-                reply = f"✅ 已添加排除词: {arg}\n当前: {fmt_list(cfg['excludes'])}"
+                reply = f"✅ 已添加: {arg}"
         elif cmd == "/del_ex":
             if arg in cfg["excludes"]:
                 cfg["excludes"].remove(arg)
                 changed = True
-                reply = f"✅ 已删除排除词: {arg}"
+                reply = f"✅ 已删除: {arg}"
             else:
-                reply = f"未找到排除词: {arg}"
+                reply = f"未找到: {arg}"
         elif cmd == "/ex_keys":
             reply = f"🚫 排除词: {fmt_list(cfg['excludes'])}"
         elif cmd == "/clear_ex":
             cfg["excludes"] = []
             changed = True
             reply = "✅ 已清空排除词"
+        elif cmd == "/boards":
+            t, markup = view_boards()
+            tg_send(chat_id, t, reply_markup=markup)
+            return
+        elif cmd == "/add_board":
+            if not arg:
+                reply = "用法: /add_board trade 或 /add_board all"
+            elif arg == "all":
+                cfg["boards"] = []
+                changed = True
+                reply = "✅ 已切换为全站抓取"
+            elif arg in BOARDS:
+                subs = cfg.setdefault("boards", [])
+                if not subs:
+                    cfg["boards"] = [arg]
+                    changed = True
+                    reply = f"✅ 已关闭全站, 只订阅 {arg}"
+                elif arg in subs:
+                    reply = f"已在订阅: {arg}"
+                else:
+                    subs.append(arg)
+                    changed = True
+                    reply = f"✅ 已添加: {arg}"
+            else:
+                reply = f"未知板块: {arg}"
+        elif cmd == "/del_board":
+            if arg not in BOARDS:
+                reply = f"未知板块: {arg}"
+            else:
+                subs = cfg.setdefault("boards", [])
+                if not subs:
+                    reply = "当前是全站模式"
+                elif arg in subs:
+                    subs.remove(arg)
+                    changed = True
+                    reply = f"✅ 已删除: {arg}"
+                else:
+                    reply = f"未订阅: {arg}"
+        elif cmd == "/clear_boards":
+            cfg["boards"] = []
+            changed = True
+            reply = "✅ 已切换为全站抓取"
         elif cmd == "/interval":
             try:
                 n = int(arg)
                 if n < 10:
-                    reply = "⚠️ 间隔不能小于 10 秒"
+                    reply = "⚠️ 不能小于 10 秒"
                 else:
                     cfg["interval"] = n
                     changed = True
-                    reply = f"✅ 轮询间隔已设为 {n} 秒"
+                    reply = f"✅ 已设为 {n} 秒"
             except ValueError:
                 reply = "用法: /interval 120"
         elif cmd == "/open":
             cfg["enabled"] = True
-            # 顺便把当前 chat 设为推送目标 (方便第一次使用)
             if str(cfg.get("chat_id")) != str(chat_id):
                 cfg["chat_id"] = str(chat_id)
             changed = True
-            reply = f"✅ 提醒已开启, 推送到 chat_id: <code>{cfg['chat_id']}</code>"
+            reply = f"✅ 提醒已开启\nchat_id: <code>{cfg['chat_id']}</code>"
         elif cmd == "/close":
             cfg["enabled"] = False
             changed = True
@@ -321,33 +802,32 @@ def handle_command(msg):
             reply = (
                 f"<b>运行状态</b>\n"
                 f"开关: {'🟢 开启' if cfg['enabled'] else '🔴 关闭'}\n"
-                f"推送 chat_id: <code>{cfg.get('chat_id') or '(未设置)'}</code>\n"
+                f"chat_id: <code>{cfg.get('chat_id') or '(未设置)'}</code>\n"
                 f"间隔: {cfg['interval']} 秒\n"
-                f"板块: {CATEGORY}\n"
+                f"板块: {fmt_boards(cfg.get('boards') or [])}\n"
                 f"关键词 ({len(cfg['keywords'])}): {fmt_list(cfg['keywords'])}\n"
                 f"排除词 ({len(cfg['excludes'])}): {fmt_list(cfg['excludes'])}\n"
                 f"已去重: {len(seen)} 条"
             )
         else:
-            reply = "未知命令, 发送 /help 查看帮助"
+            reply = "未知命令, 发送 /menu 打开控制面板"
 
         if changed:
             save_config(cfg)
 
     if reply:
-        tg_send(chat_id, reply, disable_preview=True)
+        tg_send(chat_id, reply)
 
 # ========== TG long polling ==========
 def tg_updates_loop():
     offset = None
-    # 启动时跳过堆积的旧消息
     first = tg_call("getUpdates", timeout=0, offset=-1)
     if first and first.get("ok") and first.get("result"):
         offset = first["result"][-1]["update_id"] + 1
 
     while True:
         try:
-            params = {"timeout": 50}
+            params = {"timeout": 50, "allowed_updates": ["message", "callback_query"]}
             if offset is not None:
                 params["offset"] = offset
             data = tg_call("getUpdates", **params)
@@ -356,19 +836,24 @@ def tg_updates_loop():
                 continue
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
+                if "callback_query" in upd:
+                    try:
+                        handle_callback(upd["callback_query"])
+                    except Exception as e:
+                        log.exception("handle_callback error: %s", e)
+                    continue
                 msg = upd.get("message") or upd.get("edited_message")
                 if msg:
                     try:
                         handle_command(msg)
                     except Exception as e:
-                        log.exception("处理命令出错: %s", e)
+                        log.exception("handle_command error: %s", e)
         except Exception as e:
-            log.warning("getUpdates 异常: %s", e)
+            log.warning("getUpdates error: %s", e)
             time.sleep(5)
 
 # ========== RSS 轮询循环 ==========
 def poll_loop():
-    # 启动时先跑一次, 但只记录 ID 不推送 (避免上线瞬间刷屏)
     if not seen:
         try:
             r = requests.get(RSS_URL, timeout=30, proxies=PROXIES,
@@ -380,15 +865,15 @@ def poll_loop():
                 if pid:
                     seen.append(pid)
             save_seen(seen)
-            log.info("初始化完成, 记录 %d 条已有帖子, 下次开始推送新帖", len(seen))
+            log.info("init done, %d posts recorded", len(seen))
         except Exception as e:
-            log.warning("初始化拉取失败: %s", e)
+            log.warning("init fetch failed: %s", e)
 
     while True:
         try:
             poll_once()
         except Exception as e:
-            log.exception("轮询出错: %s", e)
+            log.exception("poll error: %s", e)
         with _lock:
             interval = config["interval"]
         time.sleep(max(10, interval))
@@ -396,13 +881,15 @@ def poll_loop():
 # ========== main ==========
 def main():
     if not TG_TOKEN:
-        log.error("必须设置 TG_BOT_TOKEN 环境变量")
+        log.error("TG_BOT_TOKEN required")
         return
     if not ALLOWED_IDS:
-        log.warning("未设置 ALLOWED_USER_IDS, 任何人都能控制 bot (不安全)")
+        log.warning("no ALLOWED_USER_IDS, anyone can control the bot")
 
-    log.info("启动 NodeSeek 监控, 板块=%s, 间隔=%ds, 关键词=%s, 排除词=%s",
-             CATEGORY, config["interval"], config["keywords"], config["excludes"])
+    boards = config.get("boards") or []
+    board_info = "all" if not boards else ",".join(boards)
+    log.info("NsAlert start, boards=%s, interval=%ds, keys=%s, excludes=%s",
+             board_info, config["interval"], config["keywords"], config["excludes"])
 
     t = threading.Thread(target=tg_updates_loop, daemon=True)
     t.start()
