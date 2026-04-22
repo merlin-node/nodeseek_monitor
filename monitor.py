@@ -499,7 +499,7 @@ def view_guide(chat_id):
         "• 不区分大小写\n"
         "• 多个关键词是<b>或</b>关系 (命中任一即推送)\n"
         "• 排除词优先级高于关键词\n"
-        "• 间隔 10-300 秒, 建议 60 秒"
+        "• 间隔 10-300 秒, 建议 10 秒"
     )
     text = f"{_flash_prefix(chat_id)}{body}"
     return text, kb([[btn("⬅️ 返回主菜单", "main")]])
