@@ -26,8 +26,8 @@ mkdir -p nodeseek-monitor && cd nodeseek-monitor
 mkdir -p data
 
 # 2. 拉配置文件
-wget https://raw.githubusercontent.com/merlin-node/ns_monitor/main/docker-compose.yml
-wget https://raw.githubusercontent.com/merlin-node/ns_monitor/main/.env.example -O .env
+wget https://raw.githubusercontent.com/merlin-node/nodeseek_monitor/main/docker-compose.yml
+wget https://raw.githubusercontent.com/merlin-node/nodeseek_monitor/main/.env.example -O .env
 
 # 3. 编辑 .env, 填入你的 TG_BOT_TOKEN 和 ALLOWED_USER_IDS
 nano .env
