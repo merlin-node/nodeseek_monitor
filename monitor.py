@@ -202,6 +202,14 @@ def match_hits(title, content, keywords, excludes):
         return []
     return [kw for kw in keywords if kw.lower() in hay]
 
+def format_hits(hits):
+    """命中关键词格式化: <=3 全显示, >3 显示前 3 个 + '等共 N 个'"""
+    if not hits:
+        return ""
+    if len(hits) <= 3:
+        return ", ".join(hits)
+    return f"{', '.join(hits[:3])} 等共 {len(hits)} 个"
+
 def entry_board(entry):
     tags = entry.get("tags", []) or []
     for t in tags:
@@ -255,15 +263,14 @@ def poll_once():
         link     = entry.get("link", "")
         board    = entry_board(entry)
         board_zh = BOARDS.get(board, board)
-        hit_str  = ", ".join(html.escape(h) for h in hits)
+        hits_str = format_hits(hits)
 
         msg = (
-            f"🔔 <b>NodeSeek · {html.escape(board_zh)}</b>\n\n"
-            f"🔑 <b>关键词:</b> {hit_str}\n\n"
+            f"<b>{html.escape(hits_str)} · {html.escape(board_zh)}</b>\n\n"
             f"{html.escape(title)}\n\n"
-            f"🔗 <a href=\"{html.escape(link)}\">查看原帖</a>"
+            f"{html.escape(link)}"
         )
-        tg_send(cfg["chat_id"], msg, disable_preview=False)
+        tg_send(cfg["chat_id"], msg, disable_preview=True)
         new_hits += 1
         time.sleep(0.5)
 
@@ -319,15 +326,13 @@ def view_main(chat_id):
         "🎯 <b>NsAlert 控制面板</b>\n\n"
         f"状态: {status_emoji} {status_text}　 间隔: {cfg['interval']}秒\n"
         f"关键词: {len(cfg['keywords'])} 个　 排除词: {len(cfg['excludes'])} 个\n"
-        f"板块: {board_text}\n"
-        f"已去重: {len(seen)} 条"
+        f"板块: {board_text}"
     )
     toggle_btn = btn("🔕 关闭提醒", "toggle_enabled") if cfg["enabled"] else btn("🔔 开启提醒", "toggle_enabled")
     markup = kb([
-        [toggle_btn, btn("📊 刷新状态", "main")],
+        [toggle_btn, btn("📖 说明书", "menu_guide")],
         [btn("📋 关键词管理", "menu_keys"), btn("🚫 排除词管理", "menu_ex")],
         [btn("📑 板块订阅", "menu_boards"), btn("⚙️ 间隔设置", "menu_interval")],
-        [btn("📖 说明书", "menu_guide")],
     ])
     return text, markup
 
@@ -499,7 +504,7 @@ def view_guide(chat_id):
         "• 不区分大小写\n"
         "• 多个关键词是<b>或</b>关系 (命中任一即推送)\n"
         "• 排除词优先级高于关键词\n"
-        "• 间隔 10-300 秒, 建议 10 秒"
+        "• 间隔 10-300 秒, 建议 60 秒"
     )
     text = f"{_flash_prefix(chat_id)}{body}"
     return text, kb([[btn("⬅️ 返回主菜单", "main")]])
