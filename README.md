@@ -1,117 +1,107 @@
-# NodeSeek 交易区关键词监控
+# NodeSeek 关键词监控
 
-通过 RSS 监控 NodeSeek 交易区新帖，命中关键词后用 Telegram Bot 推送。支持白名单、动态命令管理、排除词过滤。
+监控 NodeSeek 论坛 RSS，命中关键词即推送到 Telegram。纯面板操作，聊天界面始终干净。
 
 ## 功能
 
-- 标题 + 正文同时匹配，多关键词 OR
-- 排除词过滤（优先级高于关键词）
-- TG 命令动态增删关键词，改完即时生效
-- 白名单保护，只允许指定 TG 用户发命令
-- 配置和去重记录持久化，重启不丢
-- 轻量：运行内存 30-50MB，小鸡无压力
+- 关键词 + 排除词过滤，不区分大小写，支持标题和内容
+- 多板块订阅（trade / daily / tech / info / review / dev …）或全站模式
+- 内联按钮控制面板，所有操作原地刷新，不刷屏
+- 输入框左下角持久化菜单按钮，一点即开
+- 白名单保护（`ALLOWED_USER_IDS`），非授权用户无法操作
+- 配置和去重队列持久化到磁盘，重启不丢
 
-## 准备工作
+## 最低要求
 
-1. **创建 Bot**：Telegram 找 `@BotFather` → `/newbot` → 拿到 `TG_BOT_TOKEN`
-1. **拿 user_id**：给 `@userinfobot` 发任意消息，记下返回的 `Id`（自己和朋友的都要）
+- **1C512M** 可跑，建议 **1C1G** 起步更舒服
+- 任何支持 Docker 的 Linux 发行版
+- 一个 Telegram Bot Token（找 [@BotFather](https://t.me/BotFather) 创建）
+- 你的 Telegram user_id（找 [@userinfobot](https://t.me/userinfobot) 查）
 
-## 部署
-
-### 1. 一键拉取配置文件
-
-```bash
-mkdir -p nodeseek-monitor && cd nodeseek-monitor && \
-wget -O docker-compose.yml https://raw.githubusercontent.com/merlin-node/ns_monitor/main/docker-compose.yml && \
-wget -O .env https://raw.githubusercontent.com/merlin-node/ns_monitor/main/.env.example
-```
-
-### 2. 编辑 `.env` 填入你自己的信息
+## 快速部署
 
 ```bash
-nano .env
-```
+# 1. 克隆仓库
+git clone https://github.com/merlin-node/ns_monitor.git nodeseek-monitor
+cd nodeseek-monitor
 
-> 如果系统没装 nano：`apt install -y nano` (Debian/Ubuntu) 或 `yum install -y nano` (CentOS)。
-> nano 操作：方向键移动，直接打字编辑，`Ctrl+O` 保存（回车确认），`Ctrl+X` 退出。
+# 2. 创建 .env 文件
+cat > .env <<EOF
+TG_BOT_TOKEN=你的bot_token
+ALLOWED_USER_IDS=你的user_id
+EOF
 
-至少要改这两项：
-
-```
-TG_BOT_TOKEN=刚才BotFather给你的token
-ALLOWED_USER_IDS=你的user_id1,你的user_id2
-```
-
-其他的 `KEYWORDS`、`EXCLUDES`、`INTERVAL` 可以先留空或随便填，之后都能用 TG 命令改。
-
-### 3. 启动
-
-```bash
+# 3. 启动
 docker compose up -d
 docker compose logs -f
 ```
 
-### 4. 绑定推送目标
+启动成功后在 Telegram 打开你的 bot，发送 `/menu` 或点输入框左边的菜单按钮即可。
 
-TG 里找到你的 bot，发送 `/open`，它会自动把当前聊天设为推送目标。然后发 `/status` 确认运行正常。
+## 环境变量
 
-## 常用命令
+|变量                |必填|默认                         |说明                   |
+|------------------|--|---------------------------|---------------------|
+|`TG_BOT_TOKEN`    |✅ |-                          |Telegram Bot Token   |
+|`ALLOWED_USER_IDS`|✅ |-                          |允许使用的 user_id，多个用逗号分隔|
+|`TG_CHAT_ID`      |❌ |-                          |推送目标（留空则首次启用时自动记录）   |
+|`KEYWORDS`        |❌ |-                          |初始关键词，逗号分隔           |
+|`EXCLUDES`        |❌ |-                          |初始排除词，逗号分隔           |
+|`BOARDS`          |❌ |`trade`                    |初始订阅板块，逗号分隔，留空=全站    |
+|`INTERVAL`        |❌ |`120`                      |轮询间隔（秒），最小 10        |
+|`RSS_URL`         |❌ |`https://rss.nodeseek.com/`|RSS 源                |
+|`HTTPS_PROXY`     |❌ |-                          |HTTP 代理（大陆服务器可能需要）   |
 
-```
-部署完使用tgbot，菜单里有说明书。
-```
+所有配置启动后都可以在面板里修改，`.env` 只是初始值。
 
-非白名单用户发命令会被拒绝并记录日志。
+## 板块代号
 
-## 维护
+|代号     |中文 |代号         |中文 |
+|-------|---|-----------|---|
+|trade  |交易 |promotion  |推广 |
+|daily  |日常 |life       |生活 |
+|tech   |技术 |photo      |贴图 |
+|info   |情报 |expose     |曝光 |
+|review |测评 |meaningless|无意义|
+|dev    |Dev|sandbox    |沙盒 |
+|carpool|拼车 |           |   |
 
-**更新镜像到最新版：**
+## 匹配规则
+
+- 标题和正文都会搜索，命中任一关键词即推送
+- 排除词优先级更高，命中任一排除词的帖子直接丢弃
+- 所有匹配不区分大小写
+- 首次启动不推送历史帖子，只推送启动后的新帖
+
+## 面板说明
+
+进入 bot 发送 `/menu` 即可看到控制面板：
+
+- **🔔 开启 / 关闭提醒** — 总开关
+- **📋 关键词管理** — 添加、删除、清空
+- **🚫 排除词管理** — 同上
+- **📑 板块订阅** — 勾选订阅的板块，支持全站模式
+- **⚙️ 间隔设置** — 预设或自定义秒数
+- **📖 说明书** — 使用帮助
+
+所有操作在面板里点按钮完成，文字命令已废弃。
+
+## 数据存储
+
+数据挂载在 `./data/` 目录：
+
+- `config.json` — 运行时配置（关键词、排除词、板块、开关、间隔）
+- `seen.json` — 已推送帖子的 ID 队列（最多 500 条）
+
+删除这两个文件即可重置状态。
+
+## 更新
 
 ```bash
-docker compose pull && docker compose up -d
-```
-
-**查看日志：**
-
-```bash
-docker compose logs -f
-```
-
-**重置去重记录（会把当前 RSS 里的新帖当”已见过”）：**
-
-```bash
-docker compose down
-rm -f data/seen.json
+docker compose pull
 docker compose up -d
 ```
 
-**彻底重置配置：**
+## License
 
-```bash
-docker compose down
-rm -rf data/
-docker compose up -d
-```
-
-## 常见问题
-
-**收不到消息？**
-
-- `docker compose logs -f` 看报错
-- 发 `/status` 确认开关是开启且 `chat_id` 不为空
-- 日志报 `TG sendMessage 失败` 说明机器访问不到 `api.telegram.org`，在 `.env` 里加一行 `HTTPS_PROXY=http://你的代理:端口`
-
-**匹配规则？**
-
-- 标题 + 正文摘要一起匹配，不区分大小写
-- 多关键词是 OR 关系，命中任一即推送
-- 排除词优先级高于关键词，命中任一排除词直接丢弃
-
-**不想开机启动？**
-把 `docker-compose.yml` 里的 `restart: unless-stopped` 改成 `restart: "no"`。
-
-## 资源占用参考
-
-- 镜像大小约 80MB
-- 运行内存 30-50MB（compose 里已硬限 128M）
-- CPU 轮询瞬时 ~5%，空闲接近 0
+MIT
